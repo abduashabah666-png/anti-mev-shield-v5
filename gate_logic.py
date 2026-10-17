@@ -1,131 +1,157 @@
-"""Pure logic for the Anti-MEV Shield read-only analysis gate."""
-from __future__ import annotations
+"""Pure analysis and gate logic for Anti-MEV Shield."""
 import math
-from numbers import Real
-from typing import Any
 
 
-def _finite_number(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, Real):
-        return None
+def assess(deviation, slippage, sensitivity):
+    """Heuristic indicators only; missing data is not treated as low risk."""
+    missing = []
+    reasons = []
+    score = 0
+
+    if deviation is None:
+        missing.append("External reference deviation is unavailable.")
+    else:
+        try:
+            magnitude = abs(float(deviation))
+            if not math.isfinite(magnitude):
+                missing.append("External reference deviation is invalid.")
+            elif magnitude >= 5:
+                score += 45
+                reasons.append("Quote differs from the reference snapshot by at least 5%.")
+            elif magnitude >= 2:
+                score += 25
+                reasons.append("Quote differs from the reference snapshot by at least 2%.")
+            elif magnitude >= 1:
+                score += 10
+                reasons.append("Quote differs from the reference snapshot by at least 1%.")
+            else:
+                reasons.append("Quote deviation from the reference snapshot is below 1%.")
+        except (TypeError, ValueError, OverflowError):
+            missing.append("External reference deviation is invalid.")
+
     try:
-        number = float(value)
+        slip = float(slippage)
+        if not math.isfinite(slip) or slip < 0:
+            missing.append("Slippage value is invalid.")
+            slip = None
     except (TypeError, ValueError, OverflowError):
-        return None
-    return number if math.isfinite(number) else None
+        missing.append("Slippage value is unavailable or invalid.")
+        slip = None
 
+    if slip is not None:
+        if slip >= 3:
+            score += 25
+            reasons.append("Selected slippage tolerance is 3% or more.")
+        elif slip >= 1:
+            score += 12
+            reasons.append("Selected slippage tolerance is at least 1%.")
+        else:
+            reasons.append("Selected slippage tolerance is below 1%.")
 
-def assess(deviation: Any, slippage: Any, sensitivity: Any) -> dict:
-    """Explainable heuristic assessment; not verified MEV attack detection."""
-    dev, slip, sens = map(_finite_number, (deviation, slippage, sensitivity))
-    missing = [name for name, value in (
-        ("deviation", dev), ("slippage", slip), ("sensitivity", sens)
-    ) if value is None]
+    if sensitivity is None:
+        missing.append("Quote-size sensitivity is unavailable.")
+    else:
+        try:
+            magnitude = abs(float(sensitivity))
+            if not math.isfinite(magnitude):
+                missing.append("Quote-size sensitivity is invalid.")
+            elif magnitude >= 5:
+                score += 25
+                reasons.append("Output-per-input varies by at least 5% across probes.")
+            elif magnitude >= 2:
+                score += 15
+                reasons.append("Output-per-input varies by at least 2% across probes.")
+            elif magnitude >= 1:
+                score += 8
+                reasons.append("Output-per-input varies by at least 1% across probes.")
+            else:
+                reasons.append("Quote-size sensitivity is below 1% across tested probes.")
+        except (TypeError, ValueError, OverflowError):
+            missing.append("Quote-size sensitivity is unavailable or invalid.")
+
+    score = min(score, 100)
     if missing:
-        return {
-            "status": "insufficient_data",
-            "score": None,
-            "reasons": [f"Missing or invalid numeric data: {', '.join(missing)}."],
-            "warning": "Assessment unavailable; do not treat this as a safe quote.",
-        }
+        label, status = "Insufficient data", "insufficient_data"
+    else:
+        label = "High indicator level" if score >= 50 else "Moderate indicator level" if score >= 25 else "Lower indicator level"
+        status = "indicators_available"
 
-    score, reasons = 0, []
-    if abs(dev) >= 1.0:
-        score += 40
-        reasons.append("Price deviation is high (absolute deviation >= 1%).")
-    elif abs(dev) >= 0.5:
-        score += 20
-        reasons.append("Price deviation is elevated (absolute deviation >= 0.5%).")
-    if slip >= 1.0:
-        score += 30
-        reasons.append("Configured slippage is high (>= 1%).")
-    elif slip >= 0.5:
-        score += 15
-        reasons.append("Configured slippage is elevated (>= 0.5%).")
-    if sens >= 1.0:
-        score += 30
-        reasons.append("Quote-size sensitivity is high (>= 1%).")
-    elif sens >= 0.5:
-        score += 15
-        reasons.append("Quote-size sensitivity is elevated (>= 0.5%).")
-    if not reasons:
-        reasons.append("No elevated heuristic indicators detected in the supplied values.")
     return {
-        "status": "assessed",
-        "score": min(score, 100),
+        "score_out_of_100": score,
+        "label": label,
+        "status": status,
+        "missing_data": missing,
         "reasons": reasons,
-        "warning": "Heuristic indicators only; this is not verified MEV detection.",
+        "verified_attack_detection": False,
+        "warning": "Heuristic indicators only. This score does not confirm an attack or prove MEV prevention.",
     }
 
 
 def evaluate_gate(
-    assessment: Any, slippage: Any, deviation: Any, output: Any, minimum: Any,
-    max_allowed_score: Any, max_allowed_slippage: Any, max_allowed_deviation: Any,
-) -> dict:
-    """Validate gate inputs and return PASS/BLOCK for analysis only."""
+    assessment,
+    slippage,
+    deviation,
+    output,
+    minimum,
+    max_allowed_score=24,
+    max_allowed_slippage=0.5,
+    max_allowed_deviation=1.0,
+):
+    """Application-level gate only; it never submits or blocks blockchain transactions."""
     reasons = []
-    slip, dev, out_value, min_value, max_score, max_slip, max_dev = map(
-        _finite_number,
-        (slippage, deviation, output, minimum, max_allowed_score,
-         max_allowed_slippage, max_allowed_deviation),
-    )
 
     if not isinstance(assessment, dict):
         assessment = {}
-        reasons.append("Assessment data is missing or invalid.")
-    status = assessment.get("status")
-    score = _finite_number(assessment.get("score"))
-    if status == "insufficient_data" or score is None:
-        reasons.append("Assessment is incomplete or contains invalid data.")
-    elif status not in ("assessed", "ok", "success"):
-        reasons.append("Assessment status is not recognized.")
+        reasons.append("Analysis assessment is unavailable or invalid.")
 
-    if slip is None:
-        reasons.append("Slippage is missing or not a finite number.")
-    elif slip < 0:
-        reasons.append("Slippage cannot be negative.")
-    if dev is None:
-        reasons.append("Deviation is missing or not a finite number.")
-    if out_value is None:
-        reasons.append("Estimated output is missing or not a finite number.")
-    elif out_value <= 0:
-        reasons.append("Estimated output must be greater than zero.")
-    if min_value is None:
-        reasons.append("Minimum output is missing or not a finite number.")
-    elif min_value <= 0:
-        reasons.append("Minimum output must be greater than zero.")
+    if assessment.get("status") != "indicators_available":
+        reasons.append("Required analysis data is missing.")
 
-    if max_score is None or not 0 <= max_score <= 100:
-        reasons.append("Maximum allowed score must be finite and between 0 and 100.")
-    if max_slip is None or max_slip < 0:
-        reasons.append("Maximum allowed slippage must be finite and non-negative.")
-    if max_dev is None or max_dev < 0:
-        reasons.append("Maximum allowed absolute deviation must be finite and non-negative.")
+    try:
+        score = assessment.get("score_out_of_100")
+        if score is None or not math.isfinite(float(score)):
+            reasons.append("Heuristic score is unavailable or invalid.")
+        elif float(score) > float(max_allowed_score):
+            reasons.append(f"Heuristic score {score} exceeds configured maximum {max_allowed_score}.")
+    except (TypeError, ValueError, OverflowError):
+        reasons.append("Heuristic score or configured maximum is invalid.")
 
-    if score is not None:
-        if not 0 <= score <= 100:
-            reasons.append("Assessment score must be between 0 and 100.")
-        elif max_score is not None and 0 <= max_score <= 100 and score > max_score:
-            reasons.append(f"Risk score {score:g} exceeds the allowed maximum {max_score:g}.")
-    if slip is not None and slip >= 0 and max_slip is not None and max_slip >= 0:
-        if slip > max_slip:
-            reasons.append(f"Slippage {slip:g}% exceeds the allowed maximum {max_slip:g}%.")
-    if dev is not None and max_dev is not None and max_dev >= 0:
-        if abs(dev) > max_dev:
-            reasons.append(
-                f"Absolute deviation {abs(dev):g}% exceeds the allowed maximum {max_dev:g}%."
-            )
-    if out_value is not None and min_value is not None and min_value > out_value:
-        reasons.append("Minimum output exceeds estimated output; quote data is inconsistent.")
+    try:
+        if slippage is None or not math.isfinite(float(slippage)):
+            reasons.append("Slippage value is unavailable or invalid.")
+        elif float(slippage) < 0:
+            reasons.append("Slippage value cannot be negative.")
+        elif float(slippage) > float(max_allowed_slippage):
+            reasons.append(f"Slippage {float(slippage):.2f}% exceeds configured maximum {float(max_allowed_slippage):.2f}%.")
+    except (TypeError, ValueError, OverflowError):
+        reasons.append("Slippage value or configured maximum is invalid.")
 
-    blocked = bool(reasons)
+    try:
+        if deviation is None or not math.isfinite(float(deviation)):
+            reasons.append("Reference-price deviation is unavailable or invalid.")
+        elif abs(float(deviation)) > float(max_allowed_deviation):
+            reasons.append(f"Absolute reference deviation {abs(float(deviation)):.3f}% exceeds configured maximum {float(max_allowed_deviation):.2f}%.")
+    except (TypeError, ValueError, OverflowError):
+        reasons.append("Reference-price deviation or configured maximum is invalid.")
+
+    try:
+        if output is None or minimum is None:
+            reasons.append("Quote output or minimum output is unavailable.")
+        else:
+            out_value = float(output)
+            min_value = float(minimum)
+            if not math.isfinite(out_value) or not math.isfinite(min_value):
+                reasons.append("Quote output or minimum output must be finite numbers.")
+            elif out_value <= 0 or min_value <= 0:
+                reasons.append("Quote output or minimum output is not positive.")
+            elif min_value > out_value:
+                reasons.append("Minimum output exceeds estimated output; quote data is inconsistent.")
+    except (TypeError, ValueError, OverflowError):
+        reasons.append("Quote output or minimum output is unavailable or invalid.")
+
     return {
-        "status": "BLOCK" if blocked else "PASS (analysis gate only)",
-        "reasons": reasons or ["All configured analysis-gate checks passed."],
+        "status": "BLOCK" if reasons else "PASS (analysis gate only)",
+        "reasons": reasons,
         "execution_performed": False,
         "does_not_block_onchain_transactions": True,
-        "warning": (
-            "Read-only analysis gate: it does not submit, cancel, or block transactions "
-            "on-chain and does not guarantee MEV prevention."
-        ),
     }
