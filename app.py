@@ -389,9 +389,9 @@ elif run:
 
         st.subheader("V5 pre-trade safety gate")
         st.caption("This gate decides whether the prototype would allow a later execution layer to proceed. It does not execute or block a blockchain transaction.")
-        max_allowed_score = st.slider("Maximum heuristic score allowed to proceed", 0, 100, 24, 1)
-        max_allowed_slippage = st.slider("Maximum slippage allowed to proceed (%)", 0.1, 5.0, 0.5, 0.1)
-        max_allowed_deviation = st.slider("Maximum absolute reference deviation allowed (%)", 0.1, 10.0, 1.0, 0.1)
+        max_allowed_score = st.number_input("Maximum heuristic score allowed to proceed", min_value=0, max_value=100, value=24, step=1, key="gate_max_score")
+        max_allowed_slippage = st.number_input("Maximum slippage allowed to proceed (%)", min_value=0.1, max_value=5.0, value=0.5, step=0.1, format="%.2f", key="gate_max_slippage")
+        max_allowed_deviation = st.number_input("Maximum absolute reference deviation allowed (%)", min_value=0.1, max_value=10.0, value=1.0, step=0.1, format="%.2f", key="gate_max_deviation")
         gate_reasons = []
         if assessment["status"] != "indicators_available":
             gate_reasons.append("Required analysis data is missing.")
