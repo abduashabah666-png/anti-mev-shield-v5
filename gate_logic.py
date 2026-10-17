@@ -101,8 +101,11 @@ def evaluate_gate(
     if out is None or min_out is None:
         reasons.append("Output and minimum output must be finite numbers.")
     else:
-        if out <= 0 or min_out <= 0:
-            reasons.append("Output and minimum output must be positive, not zero or negative.")
+        if out <= 0:
+    reasons.append("Output must be positive; output is zero or negative.")
+
+if min_out <= 0:
+    reasons.append("Minimum output must be positive; minimum output is zero or negative.")
         if min_out > out:
             reasons.append("Minimum output exceeds estimated output.")
 
