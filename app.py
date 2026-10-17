@@ -1,11 +1,11 @@
 import json
-import unittest
-import streamlit as st
-import requests
-from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
-APP_VERSION = "V5.0-protection-gate"
+import requests
+import streamlit as st
+
+APP_VERSION = "V5.1-protection-gate"
 DEFAULT_RPC = "https://ethereum-rpc.publicnode.com"
 QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
 TOKENS = {
@@ -88,6 +88,55 @@ def assess(deviation, slippage, sensitivity):
     }
 
 
+def evaluate_gate(
+    assessment,
+    slippage,
+    deviation,
+    output,
+    minimum,
+    max_allowed_score=24,
+    max_allowed_slippage=0.5,
+    max_allowed_deviation=1.0,
+):
+    """Application-level gate only. It does not block or submit blockchain transactions."""
+    reasons = []
+    if assessment.get("status") != "indicators_available":
+        reasons.append("Required analysis data is missing.")
+
+    score = assessment.get("score_out_of_100")
+    if score is None:
+        reasons.append("Heuristic score is unavailable.")
+    elif score > max_allowed_score:
+        reasons.append(f"Heuristic score {score} exceeds configured maximum {max_allowed_score}.")
+
+    if slippage is None:
+        reasons.append("Slippage value is unavailable.")
+    elif slippage > max_allowed_slippage:
+        reasons.append(
+            f"Slippage {slippage:.2f}% exceeds configured maximum {max_allowed_slippage:.2f}%."
+        )
+
+    if deviation is None:
+        reasons.append("Reference-price deviation is unavailable.")
+    elif abs(deviation) > max_allowed_deviation:
+        reasons.append(
+            f"Absolute reference deviation {abs(deviation):.3f}% exceeds configured maximum {max_allowed_deviation:.2f}%."
+        )
+
+    try:
+        if output is None or minimum is None or output <= 0 or minimum <= 0:
+            reasons.append("Quote output or minimum output is not positive.")
+    except TypeError:
+        reasons.append("Quote output or minimum output is unavailable or invalid.")
+
+    return {
+        "status": "BLOCK" if reasons else "PASS (analysis gate only)",
+        "reasons": reasons,
+        "execution_performed": False,
+        "does_not_block_onchain_transactions": True,
+    }
+
+
 def rpc_call(url, method, params):
     response = requests.post(
         url,
@@ -154,34 +203,13 @@ def reference_prices(ids):
     return prices, now_utc()
 
 
-def build_report():
-    return {
-        "app": "Anti-MEV Shield",
-        "version": APP_VERSION,
-        "report_created_at_utc": now_utc(),
-        "status": "started",
-        "limitations": [
-            "Experimental proof of concept.",
-            "Read-only; no wallet connection, signing, or transaction submission.",
-            "No live mempool monitoring or private relay.",
-            "Heuristic indicators are not verified attack detection and do not prove MEV prevention.",
-        ],
-        "inputs": {},
-        "quote": None,
-        "quote_size_probes": [],
-        "reference_comparison": None,
-        "heuristic_indicators": None,
-        "errors": [],
-    }
-
-
 st.set_page_config(page_title=f"Anti-MEV Shield {APP_VERSION}", page_icon="🛡️", layout="wide")
 st.title(f"🛡️ Anti-MEV Shield {APP_VERSION}")
-st.caption("V5 prototype: read-only pre-trade safety gate, quote-size sensitivity, transparent indicators, and JSON evidence.")
+st.caption("Read-only pre-trade safety gate, quote-size sensitivity, transparent indicators, and JSON evidence.")
 st.warning(
-    "V5 is still a read-only safety-gate prototype: it does not sign or submit swaps, simulate a full swap transaction, "
-    "monitor the mempool, or provide private transaction routing. A BLOCK result prevents no on-chain transaction by itself. "
-    "Do not treat the heuristic score as verified attack detection or guaranteed MEV prevention."
+    "This is a read-only prototype. It does not sign or submit swaps, simulate a full swap transaction, "
+    "monitor the mempool, or provide private transaction routing. A BLOCK result does not block an on-chain transaction. "
+    "The heuristic score is not verified attack detection or guaranteed MEV prevention."
 )
 
 with st.sidebar:
@@ -218,7 +246,25 @@ if "last_report" not in st.session_state:
 if token_in == token_out:
     st.info("Choose two different tokens.")
 elif run:
-    report = build_report()
+    report = {
+        "app": "Anti-MEV Shield",
+        "version": APP_VERSION,
+        "report_created_at_utc": now_utc(),
+        "status": "started",
+        "limitations": [
+            "Experimental proof of concept.",
+            "Read-only; no wallet connection, signing, or transaction submission.",
+            "No live mempool monitoring or private relay.",
+            "Heuristic indicators are not verified attack detection and do not prove MEV prevention.",
+        ],
+        "inputs": {},
+        "quote": None,
+        "quote_size_probes": [],
+        "reference_comparison": None,
+        "heuristic_indicators": None,
+        "protection_gate": None,
+        "errors": [],
+    }
     report["inputs"] = {
         "input_token": token_in,
         "output_token": token_out,
@@ -272,9 +318,7 @@ elif run:
             probes = []
             with st.spinner("Comparing smaller, current, and larger quote sizes..."):
                 for probe_amount in probe_amounts:
-                    probe_output, probe_gas = get_quote(
-                        clean_rpc, token_in, token_out, FEES[fee_label], probe_amount
-                    )
+                    probe_output, probe_gas = get_quote(clean_rpc, token_in, token_out, FEES[fee_label], probe_amount)
                     probes.append({
                         "input_amount": str(probe_amount),
                         "input_token": token_in,
@@ -297,17 +341,10 @@ elif run:
                 use_container_width=True,
                 hide_index=True,
             )
-            st.metric(
-                "Variation in output per input across probes",
-                f"{sensitivity:.3f}%" if sensitivity is not None else "Unavailable",
-            )
+            st.metric("Variation in output per input across probes", f"{sensitivity:.3f}%" if sensitivity is not None else "Unavailable")
             st.caption("Three quote-size probes only; not an independently verified price-impact or MEV measurement.")
         except Exception as exc:
-            report["errors"].append({
-                "stage": "quote_size_probes",
-                "message": str(exc),
-                "occurred_at_utc": now_utc(),
-            })
+            report["errors"].append({"stage": "quote_size_probes", "message": str(exc), "occurred_at_utc": now_utc()})
             st.warning(f"Quote succeeded, but size-sensitivity probes were incomplete: {exc}")
 
         deviation = None
@@ -338,11 +375,7 @@ elif run:
                 "note": "Retrieval time is not a market-observation timestamp; data may be cached.",
             }
         except Exception as exc:
-            report["errors"].append({
-                "stage": "reference_price_comparison",
-                "message": str(exc),
-                "occurred_at_utc": now_utc(),
-            })
+            report["errors"].append({"stage": "reference_price_comparison", "message": str(exc), "occurred_at_utc": now_utc()})
             st.warning(f"External-reference comparison unavailable: {exc}")
 
         assessment = assess(deviation, slippage, sensitivity)
@@ -358,14 +391,9 @@ elif run:
         a, b, c = st.columns(3)
         a.metric("Approx. reference output", f"{expected:,.8f} {token_out}" if expected is not None else "Unavailable")
         b.metric("Quote deviation", f"{deviation:+.3f}%" if deviation is not None else "Unavailable")
-        c.metric(
-            "Reference prices",
-            f"${in_price:,.4f} / ${out_price:,.4f}" if in_price is not None and out_price is not None else "Unavailable",
-        )
+        c.metric("Reference prices", f"${in_price:,.4f} / ${out_price:,.4f}" if in_price is not None and out_price is not None else "Unavailable")
         if reference_time:
-            st.caption(
-                f"Reference prices retrieved at {reference_time}; this is retrieval time, not a guarantee of real-time data."
-            )
+            st.caption(f"Reference prices retrieved at {reference_time}; this is retrieval time, not a guarantee of real-time data.")
 
         st.subheader("Pre-trade heuristic indicators")
         st.metric("Heuristic indicator score", f"{assessment['score_out_of_100']}/100", assessment["label"])
@@ -387,40 +415,34 @@ elif run:
                 st.write("- " + item)
         st.caption(assessment["warning"])
 
-        st.subheader("V5 pre-trade safety gate")
+        st.subheader("V5.1 pre-trade safety gate")
         st.caption("This gate decides whether the prototype would allow a later execution layer to proceed. It does not execute or block a blockchain transaction.")
         max_allowed_score = st.number_input("Maximum heuristic score allowed to proceed", min_value=0, max_value=100, value=24, step=1, key="gate_max_score")
         max_allowed_slippage = st.number_input("Maximum slippage allowed to proceed (%)", min_value=0.1, max_value=5.0, value=0.5, step=0.1, format="%.2f", key="gate_max_slippage")
         max_allowed_deviation = st.number_input("Maximum absolute reference deviation allowed (%)", min_value=0.1, max_value=10.0, value=1.0, step=0.1, format="%.2f", key="gate_max_deviation")
-        gate_reasons = []
-        if assessment["status"] != "indicators_available":
-            gate_reasons.append("Required analysis data is missing.")
-        if assessment["score_out_of_100"] > max_allowed_score:
-            gate_reasons.append(f"Heuristic score {assessment['score_out_of_100']} exceeds configured maximum {max_allowed_score}.")
-        if slippage > max_allowed_slippage:
-            gate_reasons.append(f"Slippage {slippage:.2f}% exceeds configured maximum {max_allowed_slippage:.2f}%.")
-        if deviation is None:
-            gate_reasons.append("Reference-price deviation is unavailable.")
-        elif abs(deviation) > max_allowed_deviation:
-            gate_reasons.append(f"Absolute reference deviation {abs(deviation):.3f}% exceeds configured maximum {max_allowed_deviation:.2f}%.")
-        if output <= 0 or minimum <= 0:
-            gate_reasons.append("Quote output or minimum output is not positive.")
-        gate_status = "BLOCK" if gate_reasons else "PASS (analysis gate only)"
+
+        gate = evaluate_gate(
+            assessment=assessment,
+            slippage=slippage,
+            deviation=deviation,
+            output=output,
+            minimum=minimum,
+            max_allowed_score=max_allowed_score,
+            max_allowed_slippage=max_allowed_slippage,
+            max_allowed_deviation=max_allowed_deviation,
+        )
         report["protection_gate"] = {
-            "status": gate_status,
+            **gate,
             "configured_limits": {
                 "max_heuristic_score": max_allowed_score,
                 "max_slippage_percent": max_allowed_slippage,
                 "max_absolute_reference_deviation_percent": max_allowed_deviation,
             },
-            "reasons": gate_reasons,
-            "execution_performed": False,
-            "does_not_block_onchain_transactions": True,
-            "note": "This is an application-level pre-trade gate only. It is not connected to wallet signing or swap execution."
+            "note": "Application-level analysis gate only. It is not connected to wallet signing or swap execution.",
         }
-        if gate_reasons:
+        if gate["reasons"]:
             st.error("🛑 BLOCK — do not proceed with this quote in a future execution flow.")
-            for reason in gate_reasons:
+            for reason in gate["reasons"]:
                 st.write("- " + reason)
         else:
             st.success("✅ PASS — configured analysis checks passed; this is not proof of MEV safety.")
