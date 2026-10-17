@@ -1,93 +1,114 @@
-from gate_logic import assess, evaluate_gate
+"""Compatibility layer for Anti-MEV Shield V5.1.
+Application-level analysis only; does not execute or block on-chain transactions.
+"""
+from math import isfinite
 
 
-def normal_assessment():
-    return assess(deviation=0.2, slippage=0.5, sensitivity=0.1)
+def _number(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if isfinite(n) else None
 
 
-def run_gate(**overrides):
+def assess(deviation, slippage, sensitivity):
     values = {
-        "assessment": normal_assessment(),
-        "slippage": 0.5,
-        "deviation": 0.2,
-        "output": 240.0,
-        "minimum": 239.0,
-        "max_allowed_score": 24,
-        "max_allowed_slippage": 0.5,
-        "max_allowed_deviation": 1.0,
+        "reference deviation": _number(deviation),
+        "slippage": _number(slippage),
+        "quote-size sensitivity": _number(sensitivity),
     }
-    values.update(overrides)
-    return evaluate_gate(**values)
+    missing = [name for name, value in values.items() if value is None]
+    warning = (
+        "Heuristic score only; it is not a probability, verified attack detection, "
+        "or a guarantee of MEV prevention."
+    )
+    if missing:
+        return {
+            "status": "insufficient_data",
+            "score": None,
+            "score_out_of_100": None,
+            "label": "Insufficient data",
+            "reasons": ["Required analysis data is missing: " + ", ".join(missing)],
+            "missing_data": missing,
+            "warning": warning,
+        }
+
+    dev = abs(values["reference deviation"])
+    slip = max(0.0, values["slippage"])
+    sens = max(0.0, values["quote-size sensitivity"])
+    score = int(round(min(100.0, dev * 10.0 + slip * 4.0 + sens * 10.0)))
+    reasons = []
+    if dev > 1.0:
+        reasons.append("Reference-price deviation is elevated.")
+    if slip > 0.5:
+        reasons.append("Configured slippage tolerance is relatively high.")
+    if sens > 1.0:
+        reasons.append("Quote-size sensitivity is elevated.")
+    if not reasons:
+        reasons.append("No elevated heuristic indicator was detected in this snapshot.")
+    label = "Elevated indicators" if score >= 50 else (
+        "Moderate indicators" if score >= 25 else "Lower indicators"
+    )
+    return {
+        "status": "indicators_available",
+        "score": score,  # legacy key retained for existing tests
+        "score_out_of_100": score,
+        "label": label,
+        "reasons": reasons,
+        "missing_data": [],
+        "warning": warning,
+    }
 
 
-def test_pass_when_all_values_are_within_limits():
-    result = run_gate()
-    assert result["status"] == "PASS (analysis gate only)"
-    assert result["reasons"] == []
+def evaluate_gate(
+    assessment, slippage, deviation, output, minimum,
+    max_allowed_score=24, max_allowed_slippage=0.5,
+    max_allowed_deviation=1.0,
+):
+    reasons = []
+    slip = _number(slippage)
+    dev = _number(deviation)
+    out = _number(output)
+    min_out = _number(minimum)
+    max_score = _number(max_allowed_score)
+    max_slip = _number(max_allowed_slippage)
+    max_dev = _number(max_allowed_deviation)
 
+    if not isinstance(assessment, dict) or assessment.get("status") == "insufficient_data":
+        reasons.append("Required analysis data is missing.")
+    score = _number(
+        assessment.get("score_out_of_100", assessment.get("score"))
+        if isinstance(assessment, dict) else None
+    )
+    if score is None:
+        reasons.append("Heuristic score is missing or invalid.")
+    elif max_score is None or score > max_score:
+        reasons.append("Heuristic score exceeds the configured limit.")
 
-def test_block_when_slippage_exceeds_limit():
-    result = run_gate(max_allowed_slippage=0.1)
-    assert result["status"] == "BLOCK"
-    assert any("Slippage" in reason for reason in result["reasons"])
+    if slip is None or max_slip is None or slip < 0 or max_slip < 0:
+        reasons.append("Slippage values must be finite non-negative numbers.")
+    elif slip > max_slip:
+        reasons.append("Slippage exceeds the configured limit.")
 
+    if dev is None or max_dev is None or max_dev < 0:
+        reasons.append("Required analysis data is missing: reference deviation.")
+    elif abs(dev) > max_dev:
+        reasons.append("Absolute reference deviation exceeds the configured limit.")
 
-def test_block_when_deviation_exceeds_limit():
-    result = run_gate(deviation=2.0)
-    assert result["status"] == "BLOCK"
-    assert any("reference deviation" in reason for reason in result["reasons"])
+    if out is None or min_out is None:
+        reasons.append("Output and minimum output must be finite numbers.")
+    else:
+        if out <= 0 or min_out <= 0:
+            reasons.append("Output and minimum output must be positive, not zero or negative.")
+        if min_out > out:
+            reasons.append("Minimum output exceeds estimated output.")
 
-
-def test_block_when_score_exceeds_limit():
-    assessment = assess(deviation=5.0, slippage=0.5, sensitivity=0.1)
-    result = run_gate(assessment=assessment, deviation=5.0, max_allowed_deviation=10.0)
-    assert result["status"] == "BLOCK"
-    assert any("Heuristic score" in reason for reason in result["reasons"])
-
-
-def test_block_when_analysis_data_is_missing():
-    assessment = assess(deviation=None, slippage=0.5, sensitivity=0.1)
-    result = run_gate(assessment=assessment, deviation=None)
-    assert result["status"] == "BLOCK"
-    assert any("analysis data is missing" in reason for reason in result["reasons"])
-
-
-def test_block_when_output_is_zero():
-    result = run_gate(output=0.0)
-    assert result["status"] == "BLOCK"
-    assert any("not positive" in reason for reason in result["reasons"])
-
-
-def test_block_when_minimum_output_is_negative():
-    result = run_gate(minimum=-1.0)
-    assert result["status"] == "BLOCK"
-    assert any("not positive" in reason for reason in result["reasons"])
-
-
-def test_equal_slippage_limit_is_allowed():
-    result = run_gate(slippage=0.5, max_allowed_slippage=0.5)
-    assert result["status"] == "PASS (analysis gate only)"
-
-
-def test_equal_deviation_limit_is_allowed():
-    assessment = assess(deviation=1.0, slippage=0.5, sensitivity=0.1)
-    result = run_gate(assessment=assessment, deviation=1.0, max_allowed_deviation=1.0)
-    assert result["status"] == "PASS (analysis gate only)"
-
-
-def test_gate_does_not_execute_transactions():
-    result = run_gate()
-    assert result["execution_performed"] is False
-    assert result["does_not_block_onchain_transactions"] is True
-
-
-def test_block_when_minimum_exceeds_output():
-    result = run_gate(output=240.0, minimum=250.0)
-    assert result["status"] == "BLOCK"
-    assert any("Minimum output exceeds estimated output" in reason for reason in result["reasons"])
-
-
-def test_block_when_output_is_not_finite():
-    result = run_gate(output=float("inf"))
-    assert result["status"] == "BLOCK"
-    assert any("finite numbers" in reason for reason in result["reasons"])
+    return {
+        "status": "BLOCK" if reasons else "PASS (analysis gate only)",
+        "reasons": reasons,
+        "execution_performed": False,
+        "does_not_block_onchain_transactions": True,
+    }
